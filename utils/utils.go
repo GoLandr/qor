@@ -1,21 +1,30 @@
 package utils
 
 import (
+	"database/sql/driver"
 	"fmt"
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"reflect"
-	"regexp"
 	"runtime"
 	"runtime/debug"
 	"time"
 
 	"github.com/jinzhu/gorm"
+	"github.com/jinzhu/now"
+	"github.com/microcosm-cc/bluemonday"
 	"github.com/qor/qor"
 
 	"strings"
 )
+
+var HTMLSanitizer = bluemonday.UGCPolicy()
+
+func init() {
+	HTMLSanitizer.AllowStandardAttributes()
+}
 
 // HumanizeString Humanize separates string based on capitalizd letters
 // e.g. "OrderItem" -> "Order Item"
@@ -23,7 +32,7 @@ func HumanizeString(str string) string {
 	var human []rune
 	for i, l := range str {
 		if i > 0 && isUppercase(byte(l)) {
-			if i > 0 && !isUppercase(str[i-1]) || i+1 < len(str) && !isUppercase(str[i+1]) {
+			if (!isUppercase(str[i-1]) && str[i-1] != ' ') || (i+1 < len(str) && !isUppercase(str[i+1]) && str[i+1] != ' ' && str[i-1] != ' ') {
 				human = append(human, rune(' '))
 			}
 		}
@@ -36,8 +45,6 @@ func isUppercase(char byte) bool {
 	return 'A' <= char && char <= 'Z'
 }
 
-var upcaseRegexp = regexp.MustCompile("[A-Z]{3,}[a-z]")
-
 // ToParamString replaces spaces and separates words (by uppercase letters) with
 // underscores in a string, also downcase it
 // e.g. ToParamString -> to_param_string, To ParamString -> to_param_string
@@ -45,9 +52,8 @@ func ToParamString(str string) string {
 	return gorm.ToDBName(strings.Replace(str, " ", "_", -1))
 }
 
-// PatchURL updates the query part of the current request url. You can
-// access it in template by `patch_url`.
-//     patch_url "google.com" "key" "value"
+// PatchURL updates the query part of the request url.
+//     PatchURL("google.com","key","value") => "google.com?key=value"
 func PatchURL(originalURL string, params ...interface{}) (patchedURL string, err error) {
 	url, err := url.Parse(originalURL)
 	if err != nil {
@@ -72,25 +78,24 @@ func PatchURL(originalURL string, params ...interface{}) (patchedURL string, err
 	return
 }
 
-// GetLocale get locale from request, cookie, after get the locale, will write the locale to the cookie if possible
-func GetLocale(context *qor.Context) string {
-	if locale := context.Request.Header.Get("Locale"); locale != "" {
-		return locale
+// JoinURL updates the path part of the request url.
+//     JoinURL("google.com", "admin") => "google.com/admin"
+//     JoinURL("google.com?q=keyword", "admin") => "google.com/admin?q=keyword"
+func JoinURL(originalURL string, paths ...interface{}) (joinedURL string, err error) {
+	u, err := url.Parse(originalURL)
+	if err != nil {
+		return
 	}
 
-	if locale := context.Request.URL.Query().Get("locale"); locale != "" {
-		if context.Writer != nil {
-			context.Request.Header.Set("Locale", locale)
-			SetCookie(http.Cookie{Name: "locale", Value: locale, Expires: time.Now().AddDate(1, 0, 0)}, context)
-		}
-		return locale
+	var urlPaths = []string{u.Path}
+	for _, p := range paths {
+		urlPaths = append(urlPaths, fmt.Sprint(p))
 	}
 
-	if locale, err := context.Request.Cookie("locale"); err == nil {
-		return locale.Value
-	}
+	u.Path = path.Join(urlPaths...)
 
-	return ""
+	joinedURL = u.String()
+	return
 }
 
 // SetCookie set cookie for context
@@ -121,7 +126,13 @@ func Stringify(object interface{}) string {
 	scope := gorm.Scope{Value: object}
 	for _, column := range []string{"Name", "Title", "Code"} {
 		if field, ok := scope.FieldByName(column); ok {
-			return fmt.Sprintf("%v", field.Field.Interface())
+			result := field.Field.Interface()
+			if valuer, ok := result.(driver.Valuer); ok {
+				if result, err := valuer.Value(); err == nil {
+					return fmt.Sprint(result)
+				}
+			}
+			return fmt.Sprint(result)
 		}
 	}
 
@@ -164,8 +175,21 @@ func ParseTagOption(str string) map[string]string {
 
 // ExitWithMsg debug error messages and print stack
 func ExitWithMsg(msg interface{}, value ...interface{}) {
-	fmt.Printf("\n"+filenameWithLineNum()+"\n%v\n", append([]interface{}{msg}, value...)...)
+	fmt.Printf("\n"+filenameWithLineNum()+"\n"+fmt.Sprint(msg)+"\n", value...)
 	debug.PrintStack()
+}
+
+// FileServer file server that disabled file listing
+func FileServer(dir http.Dir) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := path.Join(string(dir), r.URL.Path)
+		if f, err := os.Stat(p); err == nil && !f.IsDir() {
+			http.ServeFile(w, r, p)
+			return
+		}
+
+		http.NotFound(w, r)
+	})
 }
 
 func filenameWithLineNum() string {
@@ -185,4 +209,47 @@ func filenameWithLineNum() string {
 		}
 	}
 	return ""
+}
+
+// GetLocale get locale from request, cookie, after get the locale, will write the locale to the cookie if possible
+// Overwrite the default logic with
+//     utils.GetLocale = func(context *qor.Context) string {
+//         // ....
+//     }
+var GetLocale = func(context *qor.Context) string {
+	if locale := context.Request.Header.Get("Locale"); locale != "" {
+		return locale
+	}
+
+	if locale := context.Request.URL.Query().Get("locale"); locale != "" {
+		if context.Writer != nil {
+			context.Request.Header.Set("Locale", locale)
+			SetCookie(http.Cookie{Name: "locale", Value: locale, Expires: time.Now().AddDate(1, 0, 0)}, context)
+		}
+		return locale
+	}
+
+	if locale, err := context.Request.Cookie("locale"); err == nil {
+		return locale.Value
+	}
+
+	return ""
+}
+
+// ParseTime parse time from string
+// Overwrite the default logic with
+//     utils.ParseTime = func(timeStr string, context *qor.Context) (time.Time, error) {
+//         // ....
+//     }
+var ParseTime = func(timeStr string, context *qor.Context) (time.Time, error) {
+	return now.Parse(timeStr)
+}
+
+// FormatTime format time to string
+// Overwrite the default logic with
+//     utils.FormatTime = func(time time.Time, format string, context *qor.Context) string {
+//         // ....
+//     }
+var FormatTime = func(date time.Time, format string, context *qor.Context) string {
+	return date.Format(format)
 }
